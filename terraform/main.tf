@@ -3,7 +3,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 4.0"
     }
   }
 }
@@ -12,176 +12,155 @@ provider "aws" {
   region = var.aws_region
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
+# VPC
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+  tags = {
+    Name = "special-days-vpc"
   }
 }
 
-# Create VPC
-module "vpc" {
-  source = "./modules/vpc"
-  vpc_cidr = var.vpc_cidr
+# Internet Gateway
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "special-days-igw"
+  }
 }
 
-# Create Security Groups
-module "security_groups" {
-  source = "./modules/security-groups"
-  vpc_id = module.vpc.vpc_id
+# Public Subnet
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidr
+  availability_zone       = "${var.aws_region}a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "special-days-public-subnet"
+  }
 }
 
-# Create EC2 Instance for Jenkins + Application
-resource "aws_instance" "jenkins_ec2" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
-  key_name                    = aws_key_pair.deployer.key_name
-  vpc_security_group_ids      = [module.security_groups.jenkins_sg_id]
-  subnet_id                   = module.vpc.public_subnets[0]
-  associate_public_ip_address = true
-  iam_instance_profile        = aws_iam_instance_profile.jenkins_instance_profile.name
+# Route Table
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+
+  tags = {
+    Name = "special-days-public-rt"
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+# Security Group
+resource "aws_security_group" "app_sg" {
+  name        = "special-days-sg"
+  description = "Security group for Special Days Calendar"
+  vpc_id      = aws_vpc.main.id
+
+  # SSH from Jenkins server only
+  ingress {
+    description = "SSH from Jenkins"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.jenkins_ip]
+  }
+
+  # HTTP access from anywhere
+  ingress {
+    description = "HTTP access"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Backend API access
+  ingress {
+    description = "Backend API"
+    from_port   = 5000
+    to_port     = 5000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # All outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "special-days-sg"
+  }
+}
+
+# EC2 Instance
+resource "aws_instance" "app_server" {
+  ami                    = var.ami_id
+  instance_type          = var.instance_type
+  key_name               = var.key_name
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.app_sg.id]
   
-  user_data = templatefile("${path.module}/scripts/user-data.sh", {
-    jenkins_admin_password = var.jenkins_admin_password
-    github_token           = var.github_token
-    dockerhub_username     = var.dockerhub_username
-    dockerhub_password     = var.dockerhub_password
-  })
-  
+  # User data script to install Docker on boot
+  user_data = filebase64("${path.module}/userdata.sh")
+
   root_block_device {
-    volume_size = 30
-    volume_type = "gp3"
+    volume_size = 20
+    volume_type = "gp2"
   }
-  
-  tags = {
-    Name = "Jenkins-CI-CD-Server"
-  }
-  
-  depends_on = [aws_key_pair.deployer]
-}
-
-# Create Application Load Balancer
-resource "aws_lb" "application_lb" {
-  name               = "special-days-lb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [module.security_groups.alb_sg_id]
-  subnets            = module.vpc.public_subnets
-
-  enable_deletion_protection = false
 
   tags = {
-    Environment = "production"
+    Name = "special-days-calendar-app"
   }
-}
 
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.application_lb.arn
-  port              = "80"
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app_tg.arn
-  }
-}
-
-resource "aws_lb_target_group" "app_tg" {
-  name     = "special-days-tg"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = module.vpc.vpc_id
-
-  health_check {
-    enabled             = true
-    interval            = 30
-    path                = "/"
-    port                = "traffic-port"
-    healthy_threshold   = 3
-    unhealthy_threshold = 3
-    timeout             = 5
-  }
-}
-
-resource "aws_lb_target_group_attachment" "app_tg_attachment" {
-  target_group_arn = aws_lb_target_group.app_tg.arn
-  target_id        = aws_instance.jenkins_ec2.id
-  port             = 80
-}
-
-# Key Pair
-resource "aws_key_pair" "deployer" {
-  key_name   = "deployer-key-${random_id.suffix.hex}"
-  public_key = file(var.public_key_path)
-}
-
-resource "random_id" "suffix" {
-  byte_length = 4
-}
-
-# IAM Role for Jenkins
-resource "aws_iam_role" "jenkins_role" {
-  name = "jenkins-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      },
+  # Ensure Docker is installed before provisioning
+  provisioner "remote-exec" {
+    inline = [
+      "echo 'Waiting for Docker installation...'",
+      "while [ ! -f /tmp/docker-installed ]; do sleep 2; done",
+      "echo 'Docker installation complete!'"
     ]
-  })
+
+    connection {
+      type        = "ssh"
+      user        = "ec2-user"
+      private_key = file("~/.ssh/${var.key_name}.pem")
+      host        = self.public_ip
+    }
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "ec2_full_access" {
-  role       = aws_iam_role.jenkins_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2FullAccess"
+# Elastic IP
+resource "aws_eip" "app_eip" {
+  instance = aws_instance.app_server.id
+  vpc      = true
+
+  tags = {
+    Name = "special-days-eip"
+  }
 }
 
-resource "aws_iam_role_policy_attachment" "s3_full_access" {
-  role       = aws_iam_role.jenkins_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-}
-
-resource "aws_iam_role_policy_attachment" "ecr_full_access" {
-  role       = aws_iam_role.jenkins_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
-}
-
-resource "aws_iam_instance_profile" "jenkins_instance_profile" {
-  name = "jenkins-instance-profile"
-  role = aws_iam_role.jenkins_role.name
-}
-
-# Outputs
-output "jenkins_server_ip" {
-  value       = aws_instance.jenkins_ec2.public_ip
-  description = "Jenkins Server Public IP"
-}
-
-output "alb_dns_name" {
-  value       = aws_lb.application_lb.dns_name
-  description = "Application Load Balancer DNS Name"
-}
-
-output "jenkins_url" {
-  value       = "http://${aws_instance.jenkins_ec2.public_ip}:8080"
-  description = "Jenkins URL"
-}
-
-output "application_url" {
-  value       = "http://${aws_lb.application_lb.dns_name}"
-  description = "Application URL"
-}
+# Route53 DNS Record (Optional - if you have a domain)
+# resource "aws_route53_record" "app" {
+#   zone_id = "YOUR_ZONE_ID"
+#   name    = "specialdays.yourdomain.com"
+#   type    = "A"
+#   ttl     = "300"
+#   records = [aws_eip.app_eip.public_ip]
+# }
