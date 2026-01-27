@@ -7,47 +7,12 @@ pipeline {
     }
     
     stages {
-        stage('Test SSH Connection') {
+        stage('Test Connection') {
             steps {
                 sshagent(['aws-ec2-key']) {
                     sh """
-                        echo "Testing SSH connection to EC2..."
-                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} "
-                            echo '✅ Connected to EC2!'
-                            echo 'Hostname: \$(hostname)'
-                            echo 'OS: \$(cat /etc/os-release | grep PRETTY_NAME)'
-                        "
-                    """
-                }
-            }
-        }
-        
-        stage('Setup EC2') {
-            steps {
-                sshagent(['aws-ec2-key']) {
-                    sh """
-                        echo "Setting up Docker on EC2..."
-                        
-                        # Copy files to EC2
-                        scp -o StrictHostKeyChecking=no docker-compose.yml ${EC2_USER}@${EC2_IP}:/tmp/
-                        
-                        # Install Docker and Docker Compose on EC2
-                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} "
-                            echo '=== Installing Docker ==='
-                            sudo yum update -y
-                            sudo yum install -y docker
-                            sudo systemctl start docker
-                            sudo systemctl enable docker
-                            sudo usermod -aG docker ec2-user
-                            
-                            echo '=== Installing Docker Compose ==='
-                            sudo curl -L \"https://github.com/docker/compose/releases/latest/download/docker-compose-\$(uname -s)-\$(uname -m)\" -o /usr/local/bin/docker-compose
-                            sudo chmod +x /usr/local/bin/docker-compose
-                            
-                            echo '=== Checking versions ==='
-                            docker --version
-                            docker-compose --version
-                        "
+                        echo "Testing connection to EC2..."
+                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} "echo '✅ Connected to EC2' && hostname"
                     """
                 }
             }
@@ -57,29 +22,33 @@ pipeline {
             steps {
                 sshagent(['aws-ec2-key']) {
                     sh """
-                        echo "Deploying application..."
+                        echo "Deploying application to EC2..."
                         
                         # Copy all files to EC2
                         scp -o StrictHostKeyChecking=no -r backend frontend docker-compose.yml ${EC2_USER}@${EC2_IP}:/tmp/special-days/
                         
-                        # Build and run on EC2
+                        # Deploy on EC2
                         ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} "
                             cd /tmp/special-days
                             
-                            echo 'Stopping old containers...'
+                            echo '=== Stopping old containers ==='
                             sudo docker-compose down || true
                             
-                            echo 'Building and starting containers...'
-                            sudo docker-compose up --build -d
+                            echo '=== Building images ==='
+                            sudo docker build -t special-days-backend:latest ./backend
+                            sudo docker build -t special-days-frontend:latest ./frontend
                             
-                            echo 'Checking containers...'
+                            echo '=== Starting containers ==='
+                            sudo docker-compose up -d
+                            
+                            echo '=== Checking containers ==='
                             sudo docker ps
                             
-                            echo 'Waiting for services to start...'
+                            echo '=== Waiting for services ==='
                             sleep 10
                             
-                            echo 'Testing backend...'
-                            curl -f http://localhost:5000/api/health || echo 'Backend not ready yet'
+                            echo '=== Testing backend ==='
+                            curl -f http://localhost:5000/api/health && echo '✅ Backend is healthy!' || echo '⚠️ Backend check failed'
                         "
                     """
                 }
@@ -89,35 +58,44 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 sh """
-                    echo "Waiting for deployment to complete..."
-                    sleep 15
+                    echo "=== FINAL VERIFICATION ==="
                     
-                    echo "=== VERIFICATION ==="
-                    echo "Testing application..."
+                    # Give services time to start
+                    sleep 20
                     
-                    # Test backend API
-                    BACKEND_STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://${EC2_IP}/api/health || echo '000')
-                    if [ "\$BACKEND_STATUS" = "200" ]; then
-                        echo "✅ Backend is healthy (HTTP \$BACKEND_STATUS)"
+                    echo "Testing application from external network..."
+                    
+                    # Test backend
+                    BACKEND_RESPONSE=\$(curl -s http://${EC2_IP}/api/health || echo 'ERROR')
+                    echo "Backend response: \$BACKEND_RESPONSE"
+                    
+                    if echo "\$BACKEND_RESPONSE" | grep -q "healthy"; then
+                        echo "✅ Backend deployment successful!"
                     else
-                        echo "❌ Backend check failed (HTTP \$BACKEND_STATUS)"
+                        echo "❌ Backend deployment failed"
                         exit 1
                     fi
                     
                     # Test frontend
                     FRONTEND_STATUS=\$(curl -s -o /dev/null -w '%{http_code}' http://${EC2_IP}/ || echo '000')
+                    echo "Frontend HTTP status: \$FRONTEND_STATUS"
+                    
                     if [ "\$FRONTEND_STATUS" = "200" ]; then
-                        echo "✅ Frontend is accessible (HTTP \$FRONTEND_STATUS)"
+                        echo "✅ Frontend is accessible!"
                     else
-                        echo "⚠️ Frontend returned HTTP \$FRONTEND_STATUS"
+                        echo "⚠️ Frontend returned HTTP \$FRONTEND_STATUS (might be okay for SPA)"
                     fi
                     
                     echo ""
-                    echo "🎉 DEPLOYMENT SUCCESSFUL!"
-                    echo "Your application is now live at:"
-                    echo "🌐 http://${EC2_IP}"
+                    echo "🎉🎉🎉 DEPLOYMENT COMPLETED SUCCESSFULLY! 🎉🎉🎉"
+                    echo ""
+                    echo "Your Special Days Calendar is now live!"
+                    echo ""
+                    echo "🌐 Application URL: http://${EC2_IP}"
                     echo "🔧 API Health: http://${EC2_IP}/api/health"
                     echo "📅 Today's Special: http://${EC2_IP}/api/today"
+                    echo ""
+                    echo "Open the above URLs in your browser to see the application!"
                 """
             }
         }
@@ -125,10 +103,14 @@ pipeline {
     
     post {
         success {
-            echo '🎉 Pipeline succeeded! Application is deployed.'
+            echo '✅ Pipeline succeeded! Application deployed successfully.'
+            echo '🌐 Access your application at: http://44.201.53.10'
         }
         failure {
-            echo '❌ Pipeline failed. Check the logs above.'
+            echo '❌ Pipeline failed. Check logs above.'
+        }
+        always {
+            echo 'Pipeline execution completed.'
         }
     }
 }
